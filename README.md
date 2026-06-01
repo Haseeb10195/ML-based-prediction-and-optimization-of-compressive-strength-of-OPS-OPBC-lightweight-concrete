@@ -4,6 +4,7 @@ XGBoost surrogate + GA / MFO / GA+MFO Hybrid
 
 HOW TO RUN:
   1. Put this file and Input_output_dataset.csv in the SAME folder
-  2. Install: pip install flask xgboost scikit-learn deap numpy pandas
-  3. Run:     python mix_design_gui.py
-  4. Open:    http://127.0.0.1:5000
+  2. Open in terminal in same folder
+  4. Install: pip install flask xgboost scikit-learn deap numpy pandas
+  5. Run:     python mix_design_gui.py
+  6. Open:    http://127.0.0.1:5000
