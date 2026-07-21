@@ -2,12 +2,6 @@
 OPS/OPBC Concrete Mix Design Optimiser  — v3
 XGBoost surrogate + GA / MFO / GA+MFO Hybrid
 
-Changes from v2:
-  - Age constraint: Curing_FW → age ∈ [1, 56] days
-                   All other curing → age fixed at 28 days
-  - Constants note (Cement, Water, Sand) shown permanently in left panel
-  - Age constraint label shown in results table
-
 HOW TO RUN:
   1. Put this file AND Input_output_Revised.csv in the SAME folder
   2. pip install flask xgboost scikit-learn deap numpy pandas
