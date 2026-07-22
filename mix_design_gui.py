@@ -78,9 +78,9 @@ for i,(mid,ops,opbc) in enumerate(MIX_LIST):
 CURE_NAMES = [
     'Full Water Curing (FW)',
     'Air Curing (AC)',
-    '3-Week Water Curing (3W)',
-    '5-Week Water Curing (5W)',
-    '7-Week Water Curing (7W)',
+    '3-Day Water Curing (3W)',
+    '5-Day Water Curing (5W)',
+    '7-Day Water Curing (7W)',
     'Watered Twice/Day for 2 Days (2T2D)',
     'Watered Twice/Day for 6 Days (2T6D)',
     'Plastic Sheet Wrapped (PS)',
