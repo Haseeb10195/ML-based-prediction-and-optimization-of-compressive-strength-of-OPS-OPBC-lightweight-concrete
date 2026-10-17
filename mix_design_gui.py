@@ -1,11 +1,21 @@
 """
-OPS/OPBC Concrete Mix Design Optimiser  — v3
+OPS/OPBC Concrete Mix Design Optimiser  — v4
 XGBoost surrogate + GA / MFO / GA+MFO Hybrid
 
+v4 changes
+  · Predicted strength is reported with a 90% prediction interval derived from
+    the cross-validated RMSE of the surrogate, instead of a single point value.
+  · Header metrics are now 5-fold cross-validated R2 / RMSE (the previous
+    values were in-sample and therefore optimistic).
+  · "|Pred - Target|" relabelled "Surrogate convergence error" and explained.
+  · Verification caveat shown with every returned solution.
+  · Columns selected by name; dataset discovery accepts any CSV in the folder
+    that carries the required headers.
+
 HOW TO RUN:
-  1. Put this file AND Input_output_Revised.csv in the SAME folder
+  1. Put this file AND the dataset CSV in the SAME folder
   2. pip install flask xgboost scikit-learn deap numpy pandas
-  3. python mix_design_gui_v2.py
+  3. python mix_design_gui_v4.py
   4. Open http://127.0.0.1:5000
 """
 
@@ -14,67 +24,107 @@ import pandas as pd, numpy as np, random, os, warnings
 warnings.filterwarnings('ignore')
 from xgboost import XGBRegressor
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_squared_error
 from deap import base, creator, tools, algorithms
 
 app = Flask(__name__)
 
-# ── Find CSV ──────────────────────────────────────────────────────────────────
-def find_csv():
-    names = ['Input_output_Revised.csv',
-             'Input_output_Claude.csv',
-             'Input_output_dataset.csv']
-    dirs  = [os.path.dirname(os.path.abspath(__file__)), os.getcwd(),
-             '/mnt/user-data/uploads']
+# ── Expected schema ───────────────────────────────────────────────────────────
+COL_ID     = 'ID'
+COL_CEMENT = 'Cement (kg/m3)'
+COL_WATER  = 'Water (kg/m3)'
+COL_SAND   = 'Sand (kg/m3)'
+COL_SUPER  = 'Superplasticizer (kg/m3)'
+COL_OPS    = 'OPS (kg/m3)'
+COL_OPBC   = 'OPBC (kg/m3)'
+COL_AGE    = 'Age (Days)'
+COL_TARGET = 'Compressive Strength (MPa)'
+CURE_COLS  = ['Curing_FW', 'Curing_AC', 'Curing_3W', 'Curing_5W',
+              'Curing_7W', 'Curing_2T2D', 'Curing_2T6D', 'Curing_PS']
+
+FEATURE_COLS = [COL_SUPER, COL_OPS, COL_OPBC] + CURE_COLS + [COL_AGE]
+REQUIRED     = FEATURE_COLS + [COL_TARGET, COL_CEMENT, COL_WATER, COL_SAND]
+
+# Accepts the older column name Curing_2W in place of Curing_3W
+LEGACY_RENAME = {'Curing_2W': 'Curing_3W'}
+
+
+# ── Find dataset ──────────────────────────────────────────────────────────────
+def _load_candidate(path):
+    """Read a CSV and return it only if it carries the required columns."""
+    try:
+        d = pd.read_csv(path, encoding='utf-8-sig')
+    except Exception:
+        return None
+    d = d.rename(columns={k: v for k, v in LEGACY_RENAME.items() if k in d.columns})
+    if [c for c in REQUIRED if c not in d.columns]:
+        return None
+    return d
+
+
+def find_dataset():
+    preferred = ['Input_output_Revised.csv', 'Input_output_Claude.csv',
+                 'Input_output_dataset.csv', 'INPUT_1.CSV']
+    dirs = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
+
     for d in dirs:
-        for n in names:
+        for n in preferred:
             p = os.path.join(d, n)
             if os.path.exists(p):
-                print(f"  CSV: {p}"); return p
-    # last-resort: search uploads for any matching file
-    up = '/mnt/user-data/uploads'
-    if os.path.isdir(up):
-        for f in os.listdir(up):
-            if 'Revised' in f or 'Input_output' in f:
-                p = os.path.join(up, f)
-                print(f"  CSV (auto): {p}"); return p
-    raise FileNotFoundError("Cannot find CSV. Place Input_output_Revised.csv "
-                            "in the same folder as this script.")
+                df = _load_candidate(p)
+                if df is not None:
+                    print(f"  Dataset: {p}")
+                    return df
+
+    # fall back to any CSV in these folders carrying the right headers
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.lower().endswith('.csv'):
+                p = os.path.join(d, f)
+                df = _load_candidate(p)
+                if df is not None:
+                    print(f"  Dataset (auto-detected): {p}")
+                    return df
+
+    raise FileNotFoundError(
+        "No dataset found. Place the dataset CSV in the same folder as this "
+        f"script. It must contain the columns: {', '.join(REQUIRED)}")
+
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-df_raw = pd.read_csv(find_csv())
-df_raw['ID'] = df_raw['ID'].ffill()          # forward-fill mix IDs
+df_raw = find_dataset()
 
-# Feature columns (skip ID + Cement + Water + Sand → start at col 4)
-feature_cols = df_raw.columns[4:16].tolist() # 12 inputs
-target_col   = df_raw.columns[16]
+if COL_ID not in df_raw.columns:
+    raise ValueError(f"Column '{COL_ID}' not found; mix identities are required.")
+df_raw[COL_ID] = df_raw[COL_ID].ffill()
 
-X = df_raw[feature_cols].values
-y = df_raw[target_col].values
+X = df_raw[FEATURE_COLS].values.astype(float)
+y = df_raw[COL_TARGET].values.astype(float)
 
 # Column indices within the 12-feature vector
-IDX_SUPER = 0   # Superplasticizer
-IDX_OPS   = 1   # OPS (kg/m3)
-IDX_OPBC  = 2   # OPBC (kg/m3)
-IDX_CURE  = list(range(3, 11))   # 8 curing flags
-IDX_AGE   = 11  # Age (Days)
+IDX_SUPER = 0
+IDX_OPS   = 1
+IDX_OPBC  = 2
+IDX_CURE  = list(range(3, 11))
+IDX_AGE   = 11
 
 # ── Discrete OPS/OPBC mix combinations (locked ratios) ───────────────────────
-# Each mix ID has a fixed (OPS, OPBC) pair — optimiser selects mix_id ∈ {0..5}
 MIX_COMBOS = {}
-for mid in df_raw['ID'].unique():
-    row = df_raw[df_raw['ID'] == mid].iloc[0]
-    MIX_COMBOS[mid] = (float(row['OPS (kg/m3)']), float(row['OPBC (kg/m3)']))
+for mid in df_raw[COL_ID].unique():
+    row = df_raw[df_raw[COL_ID] == mid].iloc[0]
+    MIX_COMBOS[mid] = (float(row[COL_OPS]), float(row[COL_OPBC]))
 
-MIX_IDS    = sorted(MIX_COMBOS.keys())          # ['C0','C10','C20','C30','C40','C50']
-MIX_LIST   = [(mid, *MIX_COMBOS[mid]) for mid in MIX_IDS]
-# MIX_LIST[i] = (mix_id_str, OPS, OPBC)  for i in 0..5
+MIX_IDS  = sorted(MIX_COMBOS.keys())
+MIX_LIST = [(mid, *MIX_COMBOS[mid]) for mid in MIX_IDS]
+N_MIX    = len(MIX_LIST) - 1
 
 print("  Mix combinations locked:")
-for i,(mid,ops,opbc) in enumerate(MIX_LIST):
-    print(f"    [{i}] {mid}: OPS={ops:.0f}  OPBC={opbc:.0f}  "
-          f"ratio={opbc/ops:.4f}" if ops > 0 else f"    [{i}] {mid}: OPS={ops:.0f}  OPBC={opbc:.0f}")
+for i, (mid, ops, opbc) in enumerate(MIX_LIST):
+    print(f"    [{i}] {mid}: OPS={ops:.0f}  OPBC={opbc:.0f}")
 
-# Curing names (updated for new CSV: Curing_3W)
 CURE_NAMES = [
     'Full Water Curing (FW)',
     'Air Curing (AC)',
@@ -85,47 +135,78 @@ CURE_NAMES = [
     'Watered Twice/Day for 6 Days (2T6D)',
     'Plastic Sheet Wrapped (PS)',
 ]
-CURE_SHORT = ['FW','AC','3W','5W','7W','2T2D','2T6D','PS']
+CURE_SHORT = ['FW', 'AC', '3W', '5W', '7W', '2T2D', '2T6D', 'PS']
 
 # Bounds
-SUPER_MIN = float(df_raw[feature_cols[IDX_SUPER]].min())
-SUPER_MAX = float(df_raw[feature_cols[IDX_SUPER]].max())
-AGE_MIN   = max(1.0, float(df_raw[feature_cols[IDX_AGE]].min()))  # physical floor: age can't be < 1 day
-AGE_MAX   = float(df_raw[feature_cols[IDX_AGE]].max())
+SUPER_MIN = float(df_raw[COL_SUPER].min())
+SUPER_MAX = float(df_raw[COL_SUPER].max())
+AGE_MIN   = max(1.0, float(df_raw[COL_AGE].min()))
+AGE_MAX   = float(df_raw[COL_AGE].max())
 
-# Constant materials
-CEMENT = int(df_raw['Cement (kg/m3)'].iloc[0])
-WATER  = int(df_raw['Water (kg/m3)'].iloc[0])
-SAND   = int(df_raw['Sand (kg/m3)'].iloc[0])
+CEMENT = int(df_raw[COL_CEMENT].iloc[0])
+WATER  = int(df_raw[COL_WATER].iloc[0])
+SAND   = int(df_raw[COL_SAND].iloc[0])
 
-# Optimisation search space: [super, mix_id(0-5), cure_id(0-7), age]
-# 4 variables instead of 5 (OPS+OPBC replaced by single discrete mix_id)
+# Search space: [super, mix_id(0-5), cure_id(0-7), age]
 LB4 = np.array([SUPER_MIN, 0.0, 0.0, AGE_MIN])
-UB4 = np.array([SUPER_MAX, 5.0, 7.0, AGE_MAX])
+UB4 = np.array([SUPER_MAX, float(N_MIX), 7.0, AGE_MAX])
 
-# ── Train XGBoost ─────────────────────────────────────────────────────────────
+XGB_KWARGS = dict(n_estimators=300, learning_rate=0.05, max_depth=5,
+                  subsample=0.8, colsample_bytree=0.8,
+                  random_state=42, verbosity=0)
+
+
+# ── Cross-validated performance (basis of the prediction interval) ───────────
+def cv_performance(X, y, k=5, seed=42):
+    """5-fold CV R2 and RMSE. These, not in-sample values, describe the
+    expected deviation of a prediction from an experimental result."""
+    kf = KFold(n_splits=k, shuffle=True, random_state=seed)
+    r2s, rmses = [], []
+    for tr, te in kf.split(X):
+        sc = StandardScaler().fit(X[tr])
+        m  = XGBRegressor(**XGB_KWARGS)
+        m.fit(sc.transform(X[tr]), y[tr])
+        p  = m.predict(sc.transform(X[te]))
+        r2s.append(r2_score(y[te], p))
+        rmses.append(float(np.sqrt(mean_squared_error(y[te], p))))
+    return float(np.mean(r2s)), float(np.mean(rmses))
+
+
+print("  Evaluating 5-fold cross-validation …")
+CV_R2, CV_RMSE = cv_performance(X, y)
+
+# 90% interval under an approximately normal residual assumption
+PI_Z     = 1.645
+PI_LEVEL = 90
+PI_HALF  = PI_Z * CV_RMSE
+
+print(f"  CV R2   = {CV_R2:.4f}")
+print(f"  CV RMSE = {CV_RMSE:.4f} MPa")
+print(f"  {PI_LEVEL}% prediction interval half-width = +/-{PI_HALF:.2f} MPa")
+
+# ── Train the deployed surrogate on all data ─────────────────────────────────
 scaler = StandardScaler()
 X_sc   = scaler.fit_transform(X)
-xgb    = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5,
-                       subsample=0.8, colsample_bytree=0.8,
-                       random_state=42, verbosity=0)
+xgb    = XGBRegressor(**XGB_KWARGS)
 xgb.fit(X_sc, y)
-print(f"  XGBoost R² = {xgb.score(X_sc, y):.4f}")
-print(f"  CS range   = {y.min():.2f} – {y.max():.2f} MPa")
+print(f"  In-sample R2 = {xgb.score(X_sc, y):.4f}  (reference only)")
+print(f"  CS range     = {y.min():.2f} - {y.max():.2f} MPa")
+
 
 # ── Surrogate helpers ─────────────────────────────────────────────────────────
 def decode_mix(mix_idx):
-    """Return (mix_id_str, OPS, OPBC) for integer mix_idx 0-5."""
-    idx = int(round(np.clip(mix_idx, 0, len(MIX_LIST)-1)))
+    """Return (mix_id_str, OPS, OPBC) for integer mix_idx."""
+    idx = int(round(np.clip(mix_idx, 0, N_MIX)))
     return MIX_LIST[idx]
+
 
 def predict_cs(sv, mix_idx, cure_idx, age):
     mid_str, ops, opbc = decode_mix(mix_idx)
     ci  = int(round(np.clip(cure_idx, 0, 7)))
-    age = max(AGE_MIN, min(AGE_MAX, float(age)))  # defensive: never let age go out of bounds
+    age = max(AGE_MIN, min(AGE_MAX, float(age)))
     # Age constraint:
-    #   Curing_FW (ci=0) → age ∈ [1, 56] days (as tested)
-    #   All other curing → age fixed at 28 days
+    #   Curing_FW (ci=0) -> age in [1, 56] days (as tested)
+    #   All other curing -> age fixed at 28 days (only age tested)
     if ci != 0:
         age = 28.0
     vec = np.zeros(12)
@@ -135,30 +216,27 @@ def predict_cs(sv, mix_idx, cure_idx, age):
     for i, c in enumerate(IDX_CURE):
         vec[c] = 1.0 if i == ci else 0.0
     vec[IDX_AGE] = age
-    return float(xgb.predict(scaler.transform(vec.reshape(1,-1)))[0])
+    return float(xgb.predict(scaler.transform(vec.reshape(1, -1)))[0])
+
 
 def obj4(sv, mix_idx, cure_idx, age, target):
     return abs(predict_cs(sv, mix_idx, cure_idx, age) - target)
 
+
 def best_mix_scan(sv, cure_idx, age, target):
     """
-    After the algorithm converges, scan all 6 mix IDs at the best
-    [super, cure, age] and return the position with the lowest
-    |predicted CS - target CS|.
-
-    This guarantees the reported mix ID is always the most accurate one,
-    not an arbitrary result of random initialisation.
+    After convergence, scan all mix IDs at the best [super, cure, age] and
+    return the position with the lowest |predicted CS - target CS|, so the
+    reported mix is the most accurate one rather than an artefact of random
+    initialisation.
     """
-    ci = int(round(np.clip(cure_idx, 0, 7)))
-    # Apply age constraint for display in log
+    ci      = int(round(np.clip(cure_idx, 0, 7)))
     eff_age = float(age) if ci == 0 else 28.0
 
-    print(f"\n  ── Mix ID scan  (target={target} MPa | "
-          f"super={sv:.3f} | cure={CURE_SHORT[ci]} | age={int(round(eff_age))}d) ──")
+    print(f"\n  -- Mix ID scan  (target={target} MPa | "
+          f"super={sv:.3f} | cure={CURE_SHORT[ci]} | age={int(round(eff_age))}d) --")
 
-    best_pos = None
-    best_err = float('inf')
-
+    best_pos, best_err = None, float('inf')
     for mix_i in range(len(MIX_LIST)):
         mid_str, ops, opbc = MIX_LIST[mix_i]
         pred = predict_cs(sv, mix_i, cure_idx, age)
@@ -167,16 +245,16 @@ def best_mix_scan(sv, cure_idx, age, target):
         if err < best_err:
             best_err = err
             best_pos = [sv, float(mix_i), float(cure_idx), age]
-            marker = '  ← best so far'
+            marker = '  <- best so far'
         print(f"    {mid_str} (OPS={ops:.0f}, OPBC={opbc:.0f}):  "
               f"pred={pred:.3f} MPa  |error|={err:.4f} MPa{marker}")
 
     winning = MIX_LIST[int(best_pos[1])]
-    print(f"  → Selected: {winning[0]}  "
+    print(f"  -> Selected: {winning[0]}  "
           f"(OPS={winning[1]:.0f}, OPBC={winning[2]:.0f})  "
-          f"error={best_err:.4f} MPa\n")
-
+          f"convergence error={best_err:.4f} MPa\n")
     return best_pos
+
 
 def make_result(pos4, target, curve, **extra):
     sv       = float(pos4[0])
@@ -185,27 +263,31 @@ def make_result(pos4, target, curve, **extra):
     age      = pos4[3]
 
     mid_str, ops, opbc = decode_mix(mix_idx)
-    ci   = int(round(np.clip(cure_idx, 0, 7)))
-    # Enforce age constraint before final display
+    ci = int(round(np.clip(cure_idx, 0, 7)))
+
     constrained_age = float(age) if ci == 0 else 28.0
-    constrained_age = max(AGE_MIN, min(AGE_MAX, constrained_age))  # hard re-clip (defensive)
+    constrained_age = max(AGE_MIN, min(AGE_MAX, constrained_age))
     pred = predict_cs(sv, mix_idx, ci, constrained_age)
 
-    final_age = int(round(constrained_age))
-    final_age = max(1, final_age)  # absolute floor: age can never be 0 or negative
+    final_age = max(1, int(round(constrained_age)))
 
     return dict(
         superplasticiser = round(sv, 2),
         mix_id           = mid_str,
         ops              = ops,
         opbc             = opbc,
-        age              = final_age,   # integer, constraint + floor applied
-        age_note         = '1 – 56 days (FW curing)' if ci == 0 else 'Fixed at 28 days (non-FW)',
+        age              = final_age,
+        age_note         = '1 - 56 days (FW curing)' if ci == 0 else 'Fixed at 28 days (non-FW)',
         cure_idx         = ci,
         cure_name        = CURE_NAMES[ci],
         cure_short       = CURE_SHORT[ci],
-        predicted_cs     = round(pred, 3),
-        pred_error       = round(abs(pred - target), 4),
+        predicted_cs     = round(pred, 2),
+        pi_low           = round(max(0.0, pred - PI_HALF), 2),
+        pi_high          = round(pred + PI_HALF, 2),
+        pi_half          = round(PI_HALF, 2),
+        pi_level         = PI_LEVEL,
+        cv_rmse          = round(CV_RMSE, 2),
+        conv_error       = round(abs(pred - target), 4),
         target           = target,
         curve            = [round(v, 4) for v in curve],
         cement           = CEMENT,
@@ -214,10 +296,11 @@ def make_result(pos4, target, curve, **extra):
         **extra
     )
 
+
 # ── GA ────────────────────────────────────────────────────────────────────────
 def run_ga(target, n_gen=150, pop_size=200, seed=42):
     random.seed(seed); np.random.seed(seed)
-    for a in ['_FGAV2','_IGAV2']:
+    for a in ['_FGAV2', '_IGAV2']:
         if hasattr(creator, a): delattr(creator, a)
     creator.create('_FGAV2', base.Fitness, weights=(-1.0,))
     creator.create('_IGAV2', list, fitness=creator._FGAV2)
@@ -225,18 +308,18 @@ def run_ga(target, n_gen=150, pop_size=200, seed=42):
     tb = base.Toolbox()
     tb.register('ind', lambda: creator._IGAV2([
         random.uniform(SUPER_MIN, SUPER_MAX),
-        float(random.randint(0, 5)),          # mix_id  (discrete 0-5)
-        float(random.randint(0, 7)),          # cure_id (discrete 0-7)
+        float(random.randint(0, N_MIX)),
+        float(random.randint(0, 7)),
         random.uniform(AGE_MIN, AGE_MAX),
     ]))
     tb.register('pop', tools.initRepeat, list, tb.ind)
-    tb.register('evaluate', lambda ind: (obj4(ind[0],ind[1],ind[2],ind[3],target),))
+    tb.register('evaluate', lambda ind: (obj4(ind[0], ind[1], ind[2], ind[3], target),))
 
     def cx(a, b, alpha=0.5):
-        # continuous: super, age — blend then CLIP to valid bounds
+        # continuous: super, age - blend then CLIP to valid bounds
         for i, (lo_b, hi_b) in [(0, (SUPER_MIN, SUPER_MAX)), (3, (AGE_MIN, AGE_MAX))]:
-            lo = min(a[i],b[i]) - alpha*abs(a[i]-b[i])
-            hi = max(a[i],b[i]) + alpha*abs(a[i]-b[i])
+            lo = min(a[i], b[i]) - alpha * abs(a[i] - b[i])
+            hi = max(a[i], b[i]) + alpha * abs(a[i] - b[i])
             a[i] = max(lo_b, min(hi_b, random.uniform(lo, hi)))
             b[i] = max(lo_b, min(hi_b, random.uniform(lo, hi)))
         # discrete: swap mix_id and cure_id
@@ -245,21 +328,15 @@ def run_ga(target, n_gen=150, pop_size=200, seed=42):
         return a, b
 
     def mut(ind, sig=0.15, p=0.3):
-        # super
         if random.random() < p:
-            sp = SUPER_MAX - SUPER_MIN
-            ind[0] += random.gauss(0, sig*sp)
+            ind[0] += random.gauss(0, sig * (SUPER_MAX - SUPER_MIN))
             ind[0] = max(SUPER_MIN, min(SUPER_MAX, ind[0]))
-        # mix_id (discrete)
         if random.random() < p:
-            ind[1] = float(random.randint(0, 5))
-        # cure_id (discrete)
+            ind[1] = float(random.randint(0, N_MIX))
         if random.random() < p:
             ind[2] = float(random.randint(0, 7))
-        # age
         if random.random() < p:
-            sp = AGE_MAX - AGE_MIN
-            ind[3] += random.gauss(0, sig*sp)
+            ind[3] += random.gauss(0, sig * (AGE_MAX - AGE_MIN))
             ind[3] = max(AGE_MIN, min(AGE_MAX, ind[3]))
         return (ind,)
 
@@ -274,53 +351,51 @@ def run_ga(target, n_gen=150, pop_size=200, seed=42):
     for _ in range(n_gen):
         offs = algorithms.varAnd(pop, tb, cxpb=0.7, mutpb=0.3)
         for ind in offs: ind.fitness.values = tb.evaluate(ind)
-        pop = tb.select(offs+pop, k=pop_size); hof.update(pop)
+        pop = tb.select(offs + pop, k=pop_size); hof.update(pop)
         curve.append(min(ind.fitness.values[0] for ind in pop))
 
-    # Scan all mix IDs at best solution to pick the most accurate one
     best = list(hof[0])
     best = best_mix_scan(best[0], best[2], best[3], target)
     return make_result(best, target, curve)
 
+
 # ── MFO ───────────────────────────────────────────────────────────────────────
 def run_mfo(target, n=200, iters=150, b=1.0, seed=42):
     np.random.seed(seed)
-    moths   = np.random.uniform(LB4, UB4, (n, 4))
-    # snap discrete dims to integers on init
-    moths[:, 1] = np.round(moths[:, 1]).clip(0, 5)
+    moths = np.random.uniform(LB4, UB4, (n, 4))
+    moths[:, 1] = np.round(moths[:, 1]).clip(0, N_MIX)
     moths[:, 2] = np.round(moths[:, 2]).clip(0, 7)
 
-    fitness = np.array([obj4(m[0],m[1],m[2],m[3],target) for m in moths])
+    fitness = np.array([obj4(m[0], m[1], m[2], m[3], target) for m in moths])
     si      = np.argsort(fitness)
     flames  = moths[si].copy(); ff = fitness[si].copy()
     curve   = []
 
     for it in range(iters):
-        nf = max(1, round(n - it*(n-1)/iters))
+        nf = max(1, round(n - it * (n - 1) / iters))
         for i in range(n):
-            fp = flames[min(i, nf-1)]
+            fp = flames[min(i, nf - 1)]
             t  = np.random.uniform(-1, 1, 4)
             D  = np.abs(fp - moths[i])
-            moths[i] = np.clip(D*np.exp(b*t)*np.cos(2*np.pi*t)+fp, LB4, UB4)
-            # snap discrete dims
-            moths[i,1] = round(moths[i,1])
-            moths[i,2] = round(moths[i,2])
+            moths[i] = np.clip(D * np.exp(b * t) * np.cos(2 * np.pi * t) + fp, LB4, UB4)
+            moths[i, 1] = round(moths[i, 1])
+            moths[i, 2] = round(moths[i, 2])
 
-        fitness = np.array([obj4(m[0],m[1],m[2],m[3],target) for m in moths])
-        cp = np.vstack([flames, moths]); cf = np.concatenate([ff, fitness])
+        fitness = np.array([obj4(m[0], m[1], m[2], m[3], target) for m in moths])
+        cp  = np.vstack([flames, moths]); cf = np.concatenate([ff, fitness])
         si2 = np.argsort(cf)
         flames = cp[si2[:n]].copy(); ff = cf[si2[:n]].copy()
         curve.append(float(ff[0]))
 
-    # Scan all mix IDs at best solution to pick the most accurate one
     best = best_mix_scan(flames[0][0], flames[0][2], flames[0][3], target)
     return make_result(best, target, curve)
+
 
 # ── GA+MFO Hybrid ─────────────────────────────────────────────────────────────
 def run_hybrid(target, n_gen=80, n_iter=70, pop=200, n_moths=200,
                top_k=20, b=1.0, seed=42):
     random.seed(seed); np.random.seed(seed)
-    for a in ['_FHYV2','_IHYV2']:
+    for a in ['_FHYV2', '_IHYV2']:
         if hasattr(creator, a): delattr(creator, a)
     creator.create('_FHYV2', base.Fitness, weights=(-1.0,))
     creator.create('_IHYV2', list, fitness=creator._FHYV2)
@@ -328,17 +403,17 @@ def run_hybrid(target, n_gen=80, n_iter=70, pop=200, n_moths=200,
     tb = base.Toolbox()
     tb.register('ind', lambda: creator._IHYV2([
         random.uniform(SUPER_MIN, SUPER_MAX),
-        float(random.randint(0, 5)),
+        float(random.randint(0, N_MIX)),
         float(random.randint(0, 7)),
         random.uniform(AGE_MIN, AGE_MAX),
     ]))
     tb.register('pop_', tools.initRepeat, list, tb.ind)
-    tb.register('evaluate', lambda ind: (obj4(ind[0],ind[1],ind[2],ind[3],target),))
+    tb.register('evaluate', lambda ind: (obj4(ind[0], ind[1], ind[2], ind[3], target),))
 
     def cx(a, b_, alpha=0.5):
         for i, (lo_b, hi_b) in [(0, (SUPER_MIN, SUPER_MAX)), (3, (AGE_MIN, AGE_MAX))]:
-            lo = min(a[i],b_[i]) - alpha*abs(a[i]-b_[i])
-            hi = max(a[i],b_[i]) + alpha*abs(a[i]-b_[i])
+            lo = min(a[i], b_[i]) - alpha * abs(a[i] - b_[i])
+            hi = max(a[i], b_[i]) + alpha * abs(a[i] - b_[i])
             a[i]  = max(lo_b, min(hi_b, random.uniform(lo, hi)))
             b_[i] = max(lo_b, min(hi_b, random.uniform(lo, hi)))
         a[1], b_[1] = b_[1], a[1]
@@ -347,12 +422,12 @@ def run_hybrid(target, n_gen=80, n_iter=70, pop=200, n_moths=200,
 
     def mut(ind, sig=0.15, p=0.3):
         if random.random() < p:
-            ind[0] += random.gauss(0, sig*(SUPER_MAX-SUPER_MIN))
+            ind[0] += random.gauss(0, sig * (SUPER_MAX - SUPER_MIN))
             ind[0] = max(SUPER_MIN, min(SUPER_MAX, ind[0]))
-        if random.random() < p: ind[1] = float(random.randint(0, 5))
+        if random.random() < p: ind[1] = float(random.randint(0, N_MIX))
         if random.random() < p: ind[2] = float(random.randint(0, 7))
         if random.random() < p:
-            ind[3] += random.gauss(0, sig*(AGE_MAX-AGE_MIN))
+            ind[3] += random.gauss(0, sig * (AGE_MAX - AGE_MIN))
             ind[3] = max(AGE_MIN, min(AGE_MAX, ind[3]))
         return (ind,)
 
@@ -367,43 +442,43 @@ def run_hybrid(target, n_gen=80, n_iter=70, pop=200, n_moths=200,
     for _ in range(n_gen):
         offs = algorithms.varAnd(population, tb, cxpb=0.7, mutpb=0.3)
         for ind in offs: ind.fitness.values = tb.evaluate(ind)
-        population = tb.select(offs+population, k=pop)
+        population = tb.select(offs + population, k=pop)
         hof.update(population)
         ga_curve.append(min(ind.fitness.values[0] for ind in population))
 
     # MFO phase seeded from GA elite
-    seed_pos = np.array([[float(x) for x in ind] for ind in hof])
-    extra    = np.random.uniform(LB4, UB4, (n_moths-top_k, 4))
-    extra[:,1] = np.round(extra[:,1]).clip(0,5)
-    extra[:,2] = np.round(extra[:,2]).clip(0,7)
-    moths    = np.clip(np.vstack([seed_pos, extra]), LB4, UB4)
-    moths[:,1] = np.round(moths[:,1]).clip(0,5)
-    moths[:,2] = np.round(moths[:,2]).clip(0,7)
+    seed_pos    = np.array([[float(x) for x in ind] for ind in hof])
+    extra       = np.random.uniform(LB4, UB4, (n_moths - top_k, 4))
+    extra[:, 1] = np.round(extra[:, 1]).clip(0, N_MIX)
+    extra[:, 2] = np.round(extra[:, 2]).clip(0, 7)
+    moths       = np.clip(np.vstack([seed_pos, extra]), LB4, UB4)
+    moths[:, 1] = np.round(moths[:, 1]).clip(0, N_MIX)
+    moths[:, 2] = np.round(moths[:, 2]).clip(0, 7)
 
-    fitness  = np.array([obj4(m[0],m[1],m[2],m[3],target) for m in moths])
-    si       = np.argsort(fitness)
-    flames   = moths[si].copy(); ff = fitness[si].copy()
+    fitness = np.array([obj4(m[0], m[1], m[2], m[3], target) for m in moths])
+    si      = np.argsort(fitness)
+    flames  = moths[si].copy(); ff = fitness[si].copy()
     mfo_curve = []
 
     for it in range(n_iter):
-        nf = max(1, round(n_moths - it*(n_moths-1)/n_iter))
+        nf = max(1, round(n_moths - it * (n_moths - 1) / n_iter))
         for i in range(n_moths):
-            fp = flames[min(i, nf-1)]
+            fp = flames[min(i, nf - 1)]
             t  = np.random.uniform(-1, 1, 4)
             D  = np.abs(fp - moths[i])
-            moths[i] = np.clip(D*np.exp(b*t)*np.cos(2*np.pi*t)+fp, LB4, UB4)
-            moths[i,1] = round(moths[i,1])
-            moths[i,2] = round(moths[i,2])
+            moths[i] = np.clip(D * np.exp(b * t) * np.cos(2 * np.pi * t) + fp, LB4, UB4)
+            moths[i, 1] = round(moths[i, 1])
+            moths[i, 2] = round(moths[i, 2])
 
-        fitness = np.array([obj4(m[0],m[1],m[2],m[3],target) for m in moths])
-        cp = np.vstack([flames, moths]); cf = np.concatenate([ff, fitness])
+        fitness = np.array([obj4(m[0], m[1], m[2], m[3], target) for m in moths])
+        cp  = np.vstack([flames, moths]); cf = np.concatenate([ff, fitness])
         si2 = np.argsort(cf)
         flames = cp[si2[:n_moths]].copy(); ff = cf[si2[:n_moths]].copy()
         mfo_curve.append(float(ff[0]))
 
-    # Scan all mix IDs at best solution to pick the most accurate one
     best = best_mix_scan(flames[0][0], flames[0][2], flames[0][3], target)
-    return make_result(best, target, ga_curve+mfo_curve, ga_gens=n_gen)
+    return make_result(best, target, ga_curve + mfo_curve, ga_gens=n_gen)
+
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 PAGE = r"""<!DOCTYPE html>
@@ -490,8 +565,8 @@ h1{font-family:var(--mono);font-size:1.25rem;font-weight:700;letter-spacing:-.5p
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:12px;padding:40px;text-align:center;min-height:360px}
 .ph-ico{font-size:2.6rem;opacity:.4}
-.ph-txt{color:var(--muted);font-size:.82rem;line-height:1.7;max-width:260px}
-.mrow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-bottom:12px}
+.ph-txt{color:var(--muted);font-size:.82rem;line-height:1.7;max-width:290px}
+.mrow{display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:9px;margin-bottom:12px}
 .mc{background:var(--panel);border:1px solid var(--b2);border-radius:11px;padding:12px 14px}
 .mc.hi{border-color:#86EFAC;background:#F0FDF4}
 .mc-lbl{font-size:.63rem;color:var(--muted);margin-bottom:4px;font-weight:500;
@@ -499,6 +574,10 @@ h1{font-family:var(--mono);font-size:1.25rem;font-weight:700;letter-spacing:-.5p
 .mc-val{font-family:var(--mono);font-size:1.3rem;font-weight:700;color:var(--txt)}
 .mc-val.g{color:var(--good)}
 .mc-unit{font-size:.65rem;color:var(--muted);margin-left:3px}
+.mc-ci{font-family:var(--mono);font-size:.67rem;color:#15803D;margin-top:6px;
+  padding-top:6px;border-top:1px dashed #86EFAC;line-height:1.5}
+.mc-ci span{color:var(--muted)}
+.mc-sub{font-size:.6rem;color:var(--muted);margin-top:6px;line-height:1.4}
 .rtable-wrap{background:var(--panel);border:1px solid var(--b2);border-radius:13px;
   overflow:hidden;margin-bottom:10px}
 .rt-head{font-family:var(--mono);font-size:.63rem;font-weight:700;
@@ -516,18 +595,17 @@ tr:hover td{background:#F9FAFB}
 .funit{color:var(--muted);font-size:.73rem}
 .ctag{display:inline-block;padding:3px 10px;border-radius:5px;
   font-size:.73rem;font-weight:700;font-family:var(--mono)}
-.mix-badge{display:inline-block;padding:2px 8px;border-radius:4px;
-  font-family:var(--mono);font-size:.72rem;font-weight:700;
-  background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE;margin-left:6px}
-/* constant note box */
+.mix-badge{display:inline-block;padding:2px 9px;border-radius:4px;
+  font-family:var(--mono);font-size:.8rem;font-weight:700;
+  background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE}
 .note-box{background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;
   padding:11px 14px;margin-bottom:10px;display:flex;align-items:flex-start;gap:9px}
-.note-icon{font-size:1rem;flex-shrink:0;margin-top:1px}
 .note-content{font-size:.78rem;color:var(--note);line-height:1.55}
 .note-content strong{font-weight:700}
 .note-vals{font-family:var(--mono);font-size:.75rem;margin-top:4px;
   display:flex;gap:14px;flex-wrap:wrap}
 .nval{background:#DBEAFE;padding:2px 7px;border-radius:4px;color:#1E40AF;font-weight:600}
+.note-icon{font-size:1rem;flex-shrink:0;margin-top:1px}
 .ccard{background:var(--panel);border:1px solid var(--b2);border-radius:13px;padding:15px 15px 11px}
 .ctitle{font-family:var(--mono);font-size:.63rem;font-weight:700;
   color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:11px}
@@ -541,7 +619,7 @@ tr:hover td{background:#F9FAFB}
 .lsub{font-size:.71rem;color:#9CA3AF}
 .ebox{background:#FEF2F2;border:1px solid #FECACA;border-radius:9px;
   padding:10px 13px;font-size:.78rem;color:#DC2626;font-family:var(--mono);margin-top:9px}
-@media(max-width:700px){.grid{grid-template-columns:1fr}.mrow{grid-template-columns:1fr 1fr}h1{font-size:1rem}}
+@media(max-width:700px){.grid{grid-template-columns:1fr}.mrow{grid-template-columns:1fr}h1{font-size:1rem}}
 </style>
 </head>
 <body>
@@ -553,8 +631,8 @@ tr:hover td{background:#F9FAFB}
     </div>
     <p>XGBoost surrogate model &nbsp;·&nbsp; inverse prediction &nbsp;·&nbsp; metaheuristic search</p>
     <div class="pills">
-      <span class="pill pb">R² = {{ r2 }}</span>
-      <span class="pill pg">RMSE = {{ rmse }} MPa</span>
+      <span class="pill pb">CV R² = {{ cv_r2 }}</span>
+      <span class="pill pg">CV RMSE = {{ cv_rmse }} MPa</span>
       <span class="pill py">n = {{ n }} samples</span>
       <span class="pill pb">CS {{ cs_min }} – {{ cs_max }} MPa</span>
     </div>
@@ -624,9 +702,10 @@ tr:hover td{background:#F9FAFB}
         <div class="ph-ico">🔬</div>
         <div class="ph-txt">
           Enter a target CS, choose an algorithm,<br>and click <strong>Run Optimisation</strong>.<br><br>
-          The XGBoost surrogate will find the optimal
-          Mix ID (OPS/OPBC ratio) · Superplasticiser · Age · Curing Method
-          without running a single experiment.
+          The tool returns a candidate Mix ID (OPS/OPBC ratio) · Superplasticiser ·
+          Age · Curing Method for preliminary screening. Predicted strengths are
+          reported with a {{ pi_level }}% prediction interval (±{{ pi_half }} MPa)
+          and require experimental verification.
         </div>
       </div>
     </div>
@@ -677,7 +756,7 @@ async function go(){
     const d=await res.json();
     if(d.server_error){showErr(d.server_error);return;}
     render(d,algo);
-    setStatus('Done  ·  |pred − target| = '+d.pred_error+' MPa','ready');
+    setStatus('Done  ·  convergence error = '+d.conv_error+' MPa','ready');
   }catch(e){clearInterval(iv);showErr('Network error: '+e.message);}
   document.getElementById('runBtn').disabled=false;
 }
@@ -697,29 +776,39 @@ function render(d,a){
       <div class="mc hi">
         <div class="mc-lbl">Predicted CS</div>
         <div class="mc-val g">${d.predicted_cs}<span class="mc-unit">MPa</span></div>
+        <div class="mc-ci">
+          ${d.pi_level}% prediction interval<br>
+          <strong>${d.pi_low} – ${d.pi_high} MPa</strong>
+          <span>&nbsp;(±${d.pi_half})</span>
+        </div>
       </div>
       <div class="mc">
         <div class="mc-lbl">Target CS</div>
         <div class="mc-val">${d.target}<span class="mc-unit">MPa</span></div>
+        <div class="mc-sub">Prescribed by the user</div>
       </div>
       <div class="mc">
-        <div class="mc-lbl">|Pred − Target|</div>
-        <div class="mc-val" style="color:${d.pred_error<0.5?'var(--good)':'var(--warn)'}">
-          ${d.pred_error}<span class="mc-unit">MPa</span></div>
+        <div class="mc-lbl">Convergence error</div>
+        <div class="mc-val" style="color:${d.conv_error<0.5?'var(--good)':'var(--warn)'}">
+          ${d.conv_error}<span class="mc-unit">MPa</span></div>
+        <div class="mc-sub">Surrogate vs target</div>
       </div>
     </div>
 
-    <!-- Optimal mix design table -->
+    <!-- Candidate mix design table -->
     <div class="rtable-wrap">
       <div class="rt-head">
         <div class="rt-dot" style="background:${col};box-shadow:0 0 6px ${col}"></div>
-        Optimal mix design &nbsp;·&nbsp; Algorithm: <span style="color:${col};margin-left:3px">${a}</span>
+        Candidate mix design &nbsp;·&nbsp; Algorithm: <span style="color:${col};margin-left:3px">${a}</span>
       </div>
       <table>
         <thead><tr>
-          <th>Input parameter</th><th>Optimal value</th><th>Unit</th><th>Dataset range</th>
+          <th>Input parameter</th><th>Value</th><th>Unit</th><th>Dataset range</th>
         </tr></thead>
         <tbody>
+          <tr>
+            <td class="feat">Mix ID</td>
+            <td colspan="3"><span class="mix-badge">${d.mix_id}</span></td>
           </tr>
           <tr>
             <td class="feat">OPS aggregate</td>
@@ -743,7 +832,7 @@ function render(d,a){
             <td class="feat">Specimen age</td>
             <td class="fval">${d.age}</td>
             <td class="funit">days</td>
-            <td class="funit">{{ age_range }}</td>
+            <td class="funit">${d.age_note}</td>
           </tr>
           <tr>
             <td class="feat">Curing method</td>
@@ -758,7 +847,7 @@ function render(d,a){
     </div>
 
     <div class="ccard">
-      <div class="ctitle">Convergence — |predicted − target| per iteration</div>
+      <div class="ctitle">Convergence — surrogate convergence error per iteration</div>
       <div class="chartbox"><canvas id="cv"></canvas></div>
     </div>
   </div>`;
@@ -773,7 +862,7 @@ function render(d,a){
         x:{ticks:{color:'#6B7280',maxTicksLimit:8,font:{family:'IBM Plex Mono',size:9}},
            grid:{color:'#E5E7EB'},title:{display:true,text:'Iteration / Generation',color:'#9CA3AF',font:{size:9}}},
         y:{ticks:{color:'#6B7280',font:{family:'IBM Plex Mono',size:9}},
-           grid:{color:'#E5E7EB'},title:{display:true,text:'|Error| (MPa)',color:'#9CA3AF',font:{size:9}}}
+           grid:{color:'#E5E7EB'},title:{display:true,text:'Convergence error (MPa)',color:'#9CA3AF',font:{size:9}}}
       },
       plugins:{legend:{labels:{color:'#6B7280',font:{family:'IBM Plex Mono',size:9}}},
                tooltip:{callbacks:{label:c=>' Error: '+c.parsed.y.toFixed(4)+' MPa'}}}}
@@ -783,25 +872,25 @@ function render(d,a){
 </body>
 </html>"""
 
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
-    from sklearn.metrics import mean_squared_error as mse
-    r2   = round(xgb.score(X_sc, y), 4)
-    rmse = round(float(np.sqrt(mse(y, xgb.predict(X_sc)))), 2)
-    all_ops  = sorted(df_raw['OPS (kg/m3)'].unique())
-    all_opbc = sorted(df_raw['OPBC (kg/m3)'].unique())
+    all_ops  = sorted(df_raw[COL_OPS].unique())
+    all_opbc = sorted(df_raw[COL_OPBC].unique())
     return render_template_string(PAGE,
-        r2=r2, rmse=rmse, n=len(df_raw),
-        cs_min=round(float(y.min()),1),
-        cs_max=round(float(y.max()),1),
-        cs_mid=round(float((y.min()+y.max())/2),1),
+        cv_r2=round(CV_R2, 4), cv_rmse=round(CV_RMSE, 2), n=len(df_raw),
+        pi_level=PI_LEVEL, pi_half=round(PI_HALF, 2),
+        cs_min=round(float(y.min()), 1),
+        cs_max=round(float(y.max()), 1),
+        cs_mid=round(float((y.min() + y.max()) / 2), 1),
         super_range=f"{SUPER_MIN:.2f} – {SUPER_MAX:.2f}",
         ops_range  =f"{min(all_ops):.0f} – {max(all_ops):.0f}",
         opbc_range =f"{min(all_opbc):.0f} – {max(all_opbc):.0f}",
         age_range  =f"{AGE_MIN:.0f} – {AGE_MAX:.0f}",
         cement=CEMENT, water=WATER, sand=SAND,
     )
+
 
 @app.route('/opt', methods=['POST'])
 def optimise():
@@ -818,16 +907,19 @@ def optimise():
         import traceback; traceback.print_exc()
         return jsonify({'server_error': str(e)})
 
+
 if __name__ == '__main__':
-    print('\n' + '='*55)
-    print('  OPS/OPBC Mix Design Optimiser  v2')
-    print('='*55)
-    print(f'  Samples    : {len(df_raw)}')
-    print(f'  CS range   : {y.min():.2f} – {y.max():.2f} MPa')
-    print(f'  Mix IDs    : {MIX_IDS}')
-    print(f'  Constants  : Cement={CEMENT}  Water={WATER}  Sand={SAND}')
-    print('='*55)
-    print('  → Open:  http://127.0.0.1:5000')
-    print('  → Stop:  Ctrl+C')
-    print('='*55 + '\n')
+    print('\n' + '=' * 58)
+    print('  OPS/OPBC Mix Design Optimiser  v4')
+    print('=' * 58)
+    print(f'  Samples      : {len(df_raw)}')
+    print(f'  CS range     : {y.min():.2f} - {y.max():.2f} MPa')
+    print(f'  Mix IDs      : {MIX_IDS}')
+    print(f'  Constants    : Cement={CEMENT}  Water={WATER}  Sand={SAND}')
+    print(f'  CV R2 / RMSE : {CV_R2:.4f} / {CV_RMSE:.2f} MPa')
+    print(f'  {PI_LEVEL}% interval : +/-{PI_HALF:.2f} MPa')
+    print('=' * 58)
+    print('  -> Open:  http://127.0.0.1:5000')
+    print('  -> Stop:  Ctrl+C')
+    print('=' * 58 + '\n')
     app.run(debug=False, port=5000)
