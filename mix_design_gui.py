@@ -339,7 +339,8 @@ def make_result(pos4, target, curve, **extra):
         pi_half          = round(PI_HALF, 2),
         pi_level         = PI_LEVEL,
         cv_rmse          = round(CV_RMSE, 2),
-        conv_error       = round(abs(pred - target), 4),
+        # three decimals, matching the precision reported in the manuscript
+        conv_error       = round(abs(pred - target), 3),
         target           = target,
         curve            = [round(v, 4) for v in curve],
         cement           = CEMENT,
@@ -854,7 +855,8 @@ async function go(){
     const d=await res.json();
     if(d.server_error){showErr(d.server_error);return;}
     render(d,algo);
-    setStatus('Done  ·  convergence error = '+d.conv_error+' MPa','ready');
+    setStatus('Done  ·  convergence error = '
+              +Number(d.conv_error).toFixed(3)+' MPa','ready');
   }catch(e){clearInterval(iv);showErr('Network error: '+e.message);}
   document.getElementById('runBtn').disabled=false;
 }
@@ -888,7 +890,7 @@ function render(d,a){
       <div class="mc">
         <div class="mc-lbl">Convergence error</div>
         <div class="mc-val" style="color:${d.conv_error<0.5?'var(--good)':'var(--warn)'}">
-          ${d.conv_error}<span class="mc-unit">MPa</span></div>
+          ${Number(d.conv_error).toFixed(3)}<span class="mc-unit">MPa</span></div>
         <div class="mc-sub">Surrogate vs target</div>
       </div>
     </div>
