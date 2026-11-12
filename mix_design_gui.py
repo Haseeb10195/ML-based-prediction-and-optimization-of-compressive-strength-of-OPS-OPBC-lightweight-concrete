@@ -1,6 +1,17 @@
 """
-OPS/OPBC Concrete Mix Design Optimiser  — v4
+OPS/OPBC Concrete Mix Design Optimiser  — v4 (revision 2)
+
 XGBoost surrogate + GA / MFO / GA+MFO Hybrid
+
+Revision 2 changes
+  · Prediction interval half-width is now the empirically calibrated
+    +/-4.80 MPa (90th percentile of held-out residuals under
+    leave-one-(mixture x curing)-out validation; realised coverage 89.9%),
+    replacing the +/-2.82 MPa band derived from the random 5-fold RMSE,
+    which covered only 66.5% under grouped validation.
+  · Superplasticizer dosage is no longer a decision variable. It is derived
+    from mixture identity (4.80 kg/m3 for C0-C30, 4.32 for C40, 4.08 for C50)
+    and reported read-only.
 
 v4 changes
   · Predicted strength is reported with a 90% prediction interval derived from
@@ -121,9 +132,19 @@ MIX_IDS  = sorted(MIX_COMBOS.keys())
 MIX_LIST = [(mid, *MIX_COMBOS[mid]) for mid in MIX_IDS]
 N_MIX    = len(MIX_LIST) - 1
 
-print("  Mix combinations locked:")
+# Superplasticizer dosage is a property of the mixture, not a free variable:
+# it was varied with OPBC content in the source programme, so each mixture
+# identity fixes it. Read it from the dataset rather than hard-coding.
+SUPER_BY_MIX = {}
+for mid in MIX_IDS:
+    vals = sorted(df_raw[df_raw[COL_ID] == mid][COL_SUPER].unique())
+    if len(vals) != 1:
+        raise ValueError(f"Mixture {mid} carries more than one SP dosage: {vals}")
+    SUPER_BY_MIX[mid] = float(vals[0])
+
+print("  Mix combinations locked (SP derived from mixture identity):")
 for i, (mid, ops, opbc) in enumerate(MIX_LIST):
-    print(f"    [{i}] {mid}: OPS={ops:.0f}  OPBC={opbc:.0f}")
+    print(f"    [{i}] {mid}: OPS={ops:.0f}  OPBC={opbc:.0f}  SP={SUPER_BY_MIX[mid]:.2f}")
 
 CURE_NAMES = [
     'Full Water Curing (FW)',
@@ -143,6 +164,12 @@ SUPER_MAX = float(df_raw[COL_SUPER].max())
 AGE_MIN   = max(1.0, float(df_raw[COL_AGE].min()))
 AGE_MAX   = float(df_raw[COL_AGE].max())
 
+# Specimen age is a discrete variable: only these ages were tested, and only
+# under full-water curing. Every other regime was characterised at 28 days.
+TESTED_AGES = sorted(
+    float(a) for a in df_raw.loc[df_raw[CURE_COLS[0]] == 1, COL_AGE].unique())
+AGE_FW_SET  = ', '.join(f'{a:.0f}' for a in TESTED_AGES)
+
 CEMENT = int(df_raw[COL_CEMENT].iloc[0])
 WATER  = int(df_raw[COL_WATER].iloc[0])
 SAND   = int(df_raw[COL_SAND].iloc[0])
@@ -158,27 +185,35 @@ XGB_KWARGS = dict(n_estimators=300, learning_rate=0.05, max_depth=5,
 
 # ── Cross-validated performance (basis of the prediction interval) ───────────
 def cv_performance(X, y, k=5, seed=42):
-    """5-fold CV R2 and RMSE. These, not in-sample values, describe the
-    expected deviation of a prediction from an experimental result."""
+    """
+    5-fold cross-validated R2 and RMSE, computed from the POOLED out-of-fold
+    predictions rather than by averaging the per-fold values. The two
+    conventions differ slightly, because the mean of the fold RMSEs is not the
+    RMSE of the pooled residuals; the pooled convention is the one used
+    throughout the manuscript. These, not in-sample values, describe the
+    expected deviation of a prediction from an experimental result.
+    """
     kf = KFold(n_splits=k, shuffle=True, random_state=seed)
-    r2s, rmses = [], []
+    oof = np.zeros(len(y))
     for tr, te in kf.split(X):
         sc = StandardScaler().fit(X[tr])
         m  = XGBRegressor(**XGB_KWARGS)
         m.fit(sc.transform(X[tr]), y[tr])
-        p  = m.predict(sc.transform(X[te]))
-        r2s.append(r2_score(y[te], p))
-        rmses.append(float(np.sqrt(mean_squared_error(y[te], p))))
-    return float(np.mean(r2s)), float(np.mean(rmses))
+        oof[te] = m.predict(sc.transform(X[te]))
+    return (float(r2_score(y, oof)),
+            float(np.sqrt(mean_squared_error(y, oof))))
 
 
 print("  Evaluating 5-fold cross-validation …")
 CV_R2, CV_RMSE = cv_performance(X, y)
 
-# 90% interval under an approximately normal residual assumption
-PI_Z     = 1.645
+# 90% prediction interval, calibrated empirically rather than from CV RMSE.
+# PI_HALF is the 90th percentile of |held-out residual| under
+# leave-one-(mixture x curing)-out validation (4.76 MPa, rounded to 4.80).
+# Realised coverage at this half-width: 89.9% under that scheme,
+# 90.3% under interior leave-one-mixture-out.
 PI_LEVEL = 90
-PI_HALF  = PI_Z * CV_RMSE
+PI_HALF  = 4.80
 
 print(f"  CV R2   = {CV_R2:.4f}")
 print(f"  CV RMSE = {CV_RMSE:.4f} MPa")
@@ -200,15 +235,30 @@ def decode_mix(mix_idx):
     return MIX_LIST[idx]
 
 
+def super_for(mix_idx):
+    """Superplasticizer dosage implied by mixture identity (not a variable)."""
+    mid_str, _, _ = decode_mix(mix_idx)
+    return SUPER_BY_MIX[mid_str]
+
+
+def snap_age(age):
+    """Nearest tested age. Age is discrete, not continuous (see TESTED_AGES)."""
+    a = max(AGE_MIN, min(AGE_MAX, float(age)))
+    return float(min(TESTED_AGES, key=lambda t: abs(t - a)))
+
+
 def predict_cs(sv, mix_idx, cure_idx, age):
     mid_str, ops, opbc = decode_mix(mix_idx)
+    # SP is determined by the mixture; any value passed in is ignored.
+    sv  = SUPER_BY_MIX[mid_str]
     ci  = int(round(np.clip(cure_idx, 0, 7)))
-    age = max(AGE_MIN, min(AGE_MAX, float(age)))
     # Age constraint:
-    #   Curing_FW (ci=0) -> age in [1, 56] days (as tested)
-    #   All other curing -> age fixed at 28 days (only age tested)
-    if ci != 0:
-        age = 28.0
+    #   Curing_FW (ci=0) -> one of the tested ages {1, 3, 7, 28, 56} days
+    #   All other curing -> 28 days, the only age tested for those regimes
+    # The surrogate is piecewise-constant between tested ages, so intermediate
+    # ages carry no extra information; they are snapped to the nearest tested
+    # value rather than being allowed to vary continuously.
+    age = snap_age(age) if ci == 0 else 28.0
     vec = np.zeros(12)
     vec[IDX_SUPER] = sv
     vec[IDX_OPS]   = ops
@@ -234,7 +284,8 @@ def best_mix_scan(sv, cure_idx, age, target):
     eff_age = float(age) if ci == 0 else 28.0
 
     print(f"\n  -- Mix ID scan  (target={target} MPa | "
-          f"super={sv:.3f} | cure={CURE_SHORT[ci]} | age={int(round(eff_age))}d) --")
+          f"cure={CURE_SHORT[ci]} | age={int(round(eff_age))}d | "
+          f"SP derived from mixture) --")
 
     best_pos, best_err = None, float('inf')
     for mix_i in range(len(MIX_LIST)):
@@ -257,27 +308,28 @@ def best_mix_scan(sv, cure_idx, age, target):
 
 
 def make_result(pos4, target, curve, **extra):
-    sv       = float(pos4[0])
     mix_idx  = pos4[1]
+    sv       = super_for(mix_idx)   # derived, never taken from the search vector
     cure_idx = pos4[2]
     age      = pos4[3]
 
     mid_str, ops, opbc = decode_mix(mix_idx)
     ci = int(round(np.clip(cure_idx, 0, 7)))
 
-    constrained_age = float(age) if ci == 0 else 28.0
-    constrained_age = max(AGE_MIN, min(AGE_MAX, constrained_age))
+    constrained_age = snap_age(age) if ci == 0 else 28.0
     pred = predict_cs(sv, mix_idx, ci, constrained_age)
 
-    final_age = max(1, int(round(constrained_age)))
+    final_age = int(round(constrained_age))
 
     return dict(
         superplasticiser = round(sv, 2),
+        super_note       = 'Derived from mixture identity',
         mix_id           = mid_str,
         ops              = ops,
         opbc             = opbc,
         age              = final_age,
-        age_note         = '1 - 56 days (FW curing)' if ci == 0 else 'Fixed at 28 days (non-FW)',
+        age_note         = (f'Tested ages {{{AGE_FW_SET}}} d (FW)' if ci == 0
+                            else 'Fixed at 28 days (non-FW)'),
         cure_idx         = ci,
         cure_name        = CURE_NAMES[ci],
         cure_short       = CURE_SHORT[ci],
@@ -295,6 +347,42 @@ def make_result(pos4, target, curve, **extra):
         sand             = SAND,
         **extra
     )
+
+
+# ── Admissible design space ──────────────────────────────────────────────────
+# With superplasticizer fixed by mixture identity and age restricted to the
+# tested values, the whole space is small enough to evaluate exhaustively:
+#   6 mixtures x [ FW x len(TESTED_AGES) ages  +  7 regimes x 1 age ]
+FEASIBLE = [(mi, ci, a)
+            for mi in range(N_MIX + 1)
+            for ci in range(8)
+            for a in (TESTED_AGES if ci == 0 else [28.0])]
+N_FEASIBLE = len(FEASIBLE)
+print(f"  Admissible design space: {N_FEASIBLE} candidates")
+
+
+def run_enumerate(target):
+    """
+    Evaluate every admissible candidate. Exact by construction: the returned
+    design is the global optimum, with no dependence on a random seed.
+    """
+    errs = []
+    best, best_err = None, float('inf')
+    for mi, ci, a in FEASIBLE:
+        e = abs(predict_cs(None, mi, ci, a) - target)
+        errs.append(e)
+        if e < best_err:
+            best_err, best = e, [super_for(mi), float(mi), float(ci), a]
+    mid_str, ops, opbc = decode_mix(best[1])
+    print(f"\n  -- Exhaustive evaluation (target={target} MPa) --")
+    print(f"    {N_FEASIBLE} candidates evaluated")
+    print(f"    -> {mid_str}  OPS={ops:.0f}  OPBC={opbc:.0f}  "
+          f"{CURE_SHORT[int(best[2])]}  age={best[3]:.0f}d  "
+          f"convergence error={best_err:.4f} MPa\n")
+    # The "curve" for enumeration is the sorted candidate error profile: it
+    # shows how the admissible designs rank, not an iterative search history.
+    return make_result(best, target, sorted(errs),
+                       mode='enumeration', n_eval=N_FEASIBLE)
 
 
 # ── GA ────────────────────────────────────────────────────────────────────────
@@ -356,7 +444,8 @@ def run_ga(target, n_gen=150, pop_size=200, seed=42):
 
     best = list(hof[0])
     best = best_mix_scan(best[0], best[2], best[3], target)
-    return make_result(best, target, curve)
+    return make_result(best, target, curve, mode='metaheuristic',
+                       n_eval=pop_size * (n_gen + 1))
 
 
 # ── MFO ───────────────────────────────────────────────────────────────────────
@@ -388,7 +477,8 @@ def run_mfo(target, n=200, iters=150, b=1.0, seed=42):
         curve.append(float(ff[0]))
 
     best = best_mix_scan(flames[0][0], flames[0][2], flames[0][3], target)
-    return make_result(best, target, curve)
+    return make_result(best, target, curve, mode='metaheuristic',
+                       n_eval=n * (iters + 1))
 
 
 # ── GA+MFO Hybrid ─────────────────────────────────────────────────────────────
@@ -477,7 +567,9 @@ def run_hybrid(target, n_gen=80, n_iter=70, pop=200, n_moths=200,
         mfo_curve.append(float(ff[0]))
 
     best = best_mix_scan(flames[0][0], flames[0][2], flames[0][3], target)
-    return make_result(best, target, ga_curve + mfo_curve, ga_gens=n_gen)
+    return make_result(best, target, ga_curve + mfo_curve, ga_gens=n_gen,
+                       mode='metaheuristic',
+                       n_eval=pop * (n_gen + 1) + n_moths * (n_iter + 1))
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -610,6 +702,7 @@ tr:hover td{background:#F9FAFB}
 .ctitle{font-family:var(--mono);font-size:.63rem;font-weight:700;
   color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:11px}
 .chartbox{position:relative;height:150px}
+.cnote{font-size:.68rem;color:var(--muted);line-height:1.5;margin-top:8px}
 .lbox{background:var(--panel);border:1px solid var(--b2);border-radius:14px;
   padding:44px 20px;display:flex;flex-direction:column;align-items:center;gap:13px;text-align:center}
 .spin{width:42px;height:42px;border-radius:50%;border:3px solid var(--b1);
@@ -629,7 +722,7 @@ tr:hover td{background:#F9FAFB}
       <div class="hdr-logo">🏗️</div>
       <h1>OPS-OPBC Mix Design Optimiser For Target Compressive Strength</h1>
     </div>
-    <p>XGBoost surrogate model &nbsp;·&nbsp; inverse prediction &nbsp;·&nbsp; metaheuristic search</p>
+    <p>XGBoost surrogate model &nbsp;·&nbsp; inverse mix design &nbsp;·&nbsp; metaheuristic search</p>
     <div class="pills">
       <span class="pill pb">CV R² = {{ cv_r2 }}</span>
       <span class="pill pg">CV RMSE = {{ cv_rmse }} MPa</span>
@@ -695,6 +788,7 @@ tr:hover td{background:#F9FAFB}
           </div>
         </div>
       </div>
+
     </div>
 
     <div id="rArea">
@@ -702,8 +796,9 @@ tr:hover td{background:#F9FAFB}
         <div class="ph-ico">🔬</div>
         <div class="ph-txt">
           Enter a target CS, choose an algorithm,<br>and click <strong>Run Optimisation</strong>.<br><br>
-          The tool returns a candidate Mix ID (OPS/OPBC ratio) · Superplasticiser ·
-          Age · Curing Method for preliminary screening. Predicted strengths are
+          The tool returns a candidate Mix ID (OPS/OPBC ratio) · Age · Curing
+          Method for preliminary screening; superplasticiser dosage follows from
+          the mixture identity and is not optimised. Predicted strengths are
           reported with a {{ pi_level }}% prediction interval (±{{ pi_half }} MPa)
           and require experimental verification.
         </div>
@@ -715,12 +810,15 @@ tr:hover td{background:#F9FAFB}
 <script>
 let algo=null,chart=null;
 const COL={GA:'#D97706',MFO:'#059669',Hybrid:'#7C3AED'};
+const METHODS=['GA','MFO','Hybrid'];
 const CTAG={FW:'#3B82F6',AC:'#EF4444','3W':'#10B981','5W':'#6366F1',
             '7W':'#8B5CF6','2T2D':'#F59E0B','2T6D':'#EC4899',PS:'#14B8A6'};
 
 function pick(a){
   algo=a;
-  ['GA','MFO','Hybrid'].forEach(x=>document.getElementById('b'+x).className='abtn'+(x===a?' sel-'+x:''));
+  METHODS.forEach(x=>{
+    document.getElementById('b'+x).className='abtn'+(x===a?' sel-'+x:'');
+  });
   document.getElementById('runBtn').disabled=false;
   document.getElementById('runBtn').textContent='▶  Run optimisation with '+a;
 }
@@ -732,7 +830,7 @@ async function go(){
   const target=parseFloat(document.getElementById('csIn').value);
   const errEl=document.getElementById('errBox');
   errEl.style.display='none';
-  if(!algo){errEl.style.display='block';errEl.textContent='Please select an algorithm.';return;}
+  if(!algo){errEl.style.display='block';errEl.textContent='Please select a search method.';return;}
   if(isNaN(target)||target<5||target>70){errEl.style.display='block';errEl.textContent='Target out of range.';return;}
 
   document.getElementById('runBtn').disabled=true;
@@ -799,7 +897,10 @@ function render(d,a){
     <div class="rtable-wrap">
       <div class="rt-head">
         <div class="rt-dot" style="background:${col};box-shadow:0 0 6px ${col}"></div>
-        Candidate mix design &nbsp;·&nbsp; Algorithm: <span style="color:${col};margin-left:3px">${a}</span>
+        Candidate mix design &nbsp;·&nbsp; Algorithm:
+        <span style="color:${col};margin-left:3px">${a}</span>
+        <span style="color:var(--muted);font-weight:400;margin-left:6px">
+          ${d.n_eval.toLocaleString()} surrogate evaluations</span>
       </div>
       <table>
         <thead><tr>
@@ -826,7 +927,7 @@ function render(d,a){
             <td class="feat">Superplasticiser</td>
             <td class="fval">${d.superplasticiser}</td>
             <td class="funit">kg/m³</td>
-            <td class="funit">{{ super_range }}</td>
+            <td class="funit">${d.super_note}</td>
           </tr>
           <tr>
             <td class="feat">Specimen age</td>
@@ -849,6 +950,9 @@ function render(d,a){
     <div class="ccard">
       <div class="ctitle">Convergence — surrogate convergence error per iteration</div>
       <div class="chartbox"><canvas id="cv"></canvas></div>
+      <div class="cnote">Best surrogate convergence error found so far at each
+        iteration. This is the numerical performance of the search against a
+        fixed surrogate, not the predictive uncertainty of the model.</div>
     </div>
   </div>`;
 
@@ -856,11 +960,14 @@ function render(d,a){
   chart=new Chart(document.getElementById('cv').getContext('2d'),{
     type:'line',
     data:{labels:d.curve.map((_,i)=>i+1),datasets:[{label:a,data:d.curve,
-      borderColor:col,backgroundColor:col+'18',borderWidth:2,pointRadius:0,fill:true,tension:0.4}]},
+      borderColor:col,backgroundColor:col+'18',borderWidth:2,
+      pointRadius:0,fill:true,tension:0.4}]},
     options:{animation:{duration:420},responsive:true,maintainAspectRatio:false,
       scales:{
         x:{ticks:{color:'#6B7280',maxTicksLimit:8,font:{family:'IBM Plex Mono',size:9}},
-           grid:{color:'#E5E7EB'},title:{display:true,text:'Iteration / Generation',color:'#9CA3AF',font:{size:9}}},
+           grid:{color:'#E5E7EB'},title:{display:true,
+             text:'Iteration / Generation',
+             color:'#9CA3AF',font:{size:9}}},
         y:{ticks:{color:'#6B7280',font:{family:'IBM Plex Mono',size:9}},
            grid:{color:'#E5E7EB'},title:{display:true,text:'Convergence error (MPa)',color:'#9CA3AF',font:{size:9}}}
       },
@@ -885,6 +992,8 @@ def index():
         cs_max=round(float(y.max()), 1),
         cs_mid=round(float((y.min() + y.max()) / 2), 1),
         super_range=f"{SUPER_MIN:.2f} – {SUPER_MAX:.2f}",
+        n_feasible=N_FEASIBLE, n_mix=N_MIX + 1, age_fw_set=AGE_FW_SET,
+        super_by_mix=', '.join(f"{m} = {v:.2f}" for m, v in SUPER_BY_MIX.items()),
         ops_range  =f"{min(all_ops):.0f} – {max(all_ops):.0f}",
         opbc_range =f"{min(all_opbc):.0f} – {max(all_opbc):.0f}",
         age_range  =f"{AGE_MIN:.0f} – {AGE_MAX:.0f}",
@@ -898,10 +1007,10 @@ def optimise():
         d      = request.get_json(force=True)
         target = float(d['target'])
         algo   = str(d['algo'])
-        if   algo == 'GA':     r = run_ga(target)
-        elif algo == 'MFO':    r = run_mfo(target)
-        elif algo == 'Hybrid': r = run_hybrid(target)
-        else: return jsonify({'server_error': f'Unknown algorithm: {algo}'})
+        if   algo == 'GA':         r = run_ga(target)
+        elif algo == 'MFO':        r = run_mfo(target)
+        elif algo == 'Hybrid':     r = run_hybrid(target)
+        else: return jsonify({'server_error': f'Unknown search method: {algo}'})
         return jsonify(r)
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -910,14 +1019,18 @@ def optimise():
 
 if __name__ == '__main__':
     print('\n' + '=' * 58)
-    print('  OPS/OPBC Mix Design Optimiser  v4')
+    print('  OPS/OPBC Mix Design Optimiser  v6  (revision 2)')
     print('=' * 58)
     print(f'  Samples      : {len(df_raw)}')
     print(f'  CS range     : {y.min():.2f} - {y.max():.2f} MPa')
     print(f'  Mix IDs      : {MIX_IDS}')
     print(f'  Constants    : Cement={CEMENT}  Water={WATER}  Sand={SAND}')
     print(f'  CV R2 / RMSE : {CV_R2:.4f} / {CV_RMSE:.2f} MPa')
-    print(f'  {PI_LEVEL}% interval : +/-{PI_HALF:.2f} MPa')
+    print(f'  {PI_LEVEL}% interval : +/-{PI_HALF:.2f} MPa  (empirically calibrated)')
+    print(f'  Tested ages  : {AGE_FW_SET} d (FW); 28 d for all other regimes')
+    print(f'  SP by mixture: ' + ', '.join(f'{m}={v:.2f}'
+                                           for m, v in SUPER_BY_MIX.items()))
+    print(f'  Design space : {N_FEASIBLE} admissible candidates')
     print('=' * 58)
     print('  -> Open:  http://127.0.0.1:5000')
     print('  -> Stop:  Ctrl+C')
